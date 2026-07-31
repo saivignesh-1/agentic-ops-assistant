@@ -1,0 +1,5 @@
+__pycache__/
+*.pyc
+logs/*.json
+db/support_tickets.db
+.env
