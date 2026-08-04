@@ -40,6 +40,10 @@ class TraceLogger:
             print(f"{prefix} {entry['text'][:300]}")
         elif step_type == "error":
             print(f"{prefix} {entry['message']}")
+        elif step_type == "confirmation_required":
+            print(f"{prefix} {entry['tool']}({json.dumps(entry['input'])}) -- awaiting human approval")
+        elif step_type == "action_cancelled":
+            print(f"{prefix} {entry['tool']}({json.dumps(entry['input'])}) -- cancelled by user")
 
     def save(self, directory="logs"):
         os.makedirs(directory, exist_ok=True)
