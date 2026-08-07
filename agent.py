@@ -1,37 +1,16 @@
 """
-Core agent loop -- Gemini version, with human-in-the-loop confirmation.
-
-This is a ReAct-style agent: on each turn the model either
-  (a) requests a function_call -> we execute the real tool and feed the
-      result back, or
-  (b) emits a final text answer -> we stop.
-
-One tool -- update_ticket -- has real side effects (it writes to the DB).
-Tools in WRITE_TOOLS are never auto-executed: instead run_agent() pauses
-and returns a PendingAction describing exactly what it wants to do. The
-caller (cli.py / discord_bot_stub.py) shows that to a human and only
-calls resume_agent(..., approved=True) if they confirm. This mirrors how
-a real production agent should handle any action with side effects.
-
-Every step (model reasoning text, tool call, tool result, confirmation
-request, final answer) is written to a TraceLogger so the whole decision
-process is visible, not just the final output.
-
-Uses the free Gemini API (no billing required). Get a key at
-https://aistudio.google.com/apikey and set it as GEMINI_API_KEY.
+Core agent loop -- Enhanced with RBAC, Severity-based HITL, and dynamic context.
 """
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from enum import Enum
+from typing import Any, Dict, Optional, Set
 from google import genai
 from google.genai import types
 
 from tools import github_tool, database_tool, weather_tool, ticket_write_tool
 from trace_logger import TraceLogger
 
-# Google has been deprecating/retiring Gemini model names frequently in 2026
-# (2.0-flash retired March 2026, 2.5-flash cut off for new users mid-2026, etc).
-# Rather than hardcode one name that might 404 by the time you run this, try
-# a list of candidates in order and use whichever one your account can access.
 MODEL_CANDIDATES = [
     "gemini-2.5-flash-lite",
     "gemini-flash-latest",
@@ -39,25 +18,38 @@ MODEL_CANDIDATES = [
     "gemini-2.5-flash",
     "gemini-2.0-flash",
 ]
-MAX_TURNS = 8  # hard cap so a confused agent can't loop forever
+MAX_TURNS = 8
 
-# Tools listed here are never auto-executed -- the agent always pauses for
-# human confirmation first. Everything else (read-only tools) runs immediately.
-WRITE_TOOLS = {"update_ticket"}
+class ActionSeverity(Enum):
+    READ_ONLY = "read_only"
+    MEDIUM = "medium"    # e.g., updates
+    HIGH = "high"        # e.g., deletes, infrastructure changes
 
-SYSTEM_PROMPT = """You are an operations assistant with access to real tools:
+class UserRole(Enum):
+    VIEWER = "viewer"
+    OPERATOR = "operator"
+    ADMIN = "admin"
+
+@dataclass
+class UserContext:
+    user_id: str
+    role: UserRole = UserRole.OPERATOR
+
+# Define action permissions and severities
+TOOL_METADATA = {
+    "get_github_issue": {"severity": ActionSeverity.READ_ONLY, "min_role": UserRole.VIEWER},
+    "query_tickets_db": {"severity": ActionSeverity.READ_ONLY, "min_role": UserRole.VIEWER},
+    "get_weather": {"severity": ActionSeverity.READ_ONLY, "min_role": UserRole.VIEWER},
+    "update_ticket": {"severity": ActionSeverity.MEDIUM, "min_role": UserRole.OPERATOR},
+}
+
+SYSTEM_PROMPT = """You are an Operations Assistant with access to enterprise operational tools:
 - get_github_issue: look up the live status of a GitHub issue/PR
 - query_tickets_db: read-only SQL access to an internal support ticket database
 - get_weather: current weather for a city
-- update_ticket: change a ticket's status/assignee (this makes a REAL change
-  and will always require human confirmation before it takes effect, so feel
-  free to call it whenever the user asks to reassign/close/update a ticket --
-  you don't need to ask permission yourself, the system handles that)
+- update_ticket: change a ticket's status/assignee (requires human confirmation)
 
-Use tools whenever the user's request needs real, current, or specific data —
-don't guess or make up data a tool could answer. You may call multiple tools,
-and chain them (e.g. use one tool's result to decide the next call), before
-giving your final answer. Keep your final answer concise and directly useful.
+Always verify constraints before taking action. Rely on real tool data rather than assumptions.
 """
 
 DISPATCH = {
@@ -67,18 +59,12 @@ DISPATCH = {
     "update_ticket": lambda args: ticket_write_tool.run(**args),
 }
 
-
 def _to_gemini_declaration(anthropic_schema: dict) -> dict:
-    """Our tool modules define schemas in Anthropic's {name, description,
-    input_schema} shape. Gemini expects {name, description, parameters} --
-    same JSON-schema body, different key name. Convert here so tools/*.py
-    doesn't need to know which LLM backend is in use."""
     return {
         "name": anthropic_schema["name"],
         "description": anthropic_schema["description"],
         "parameters": anthropic_schema["input_schema"],
     }
-
 
 TOOLS = types.Tool(
     function_declarations=[
@@ -91,22 +77,28 @@ TOOLS = types.Tool(
 
 CONFIG = types.GenerateContentConfig(system_instruction=SYSTEM_PROMPT, tools=[TOOLS])
 
-
 @dataclass
 class PendingAction:
-    """Returned instead of a final answer when the agent wants to run a
-    write tool. Hold onto this and pass it to resume_agent() once a human
-    has approved or rejected it."""
     tool: str
     input: dict
+    severity: ActionSeverity
+    user_context: UserContext
     _contents: list
     _model: str
-    _api_key: str | None
+    _api_key: Optional[str]
 
+def _requires_approval(tool_name: str, user_context: UserContext) -> bool:
+    meta = TOOL_METADATA.get(tool_name, {"severity": ActionSeverity.HIGH})
+    
+    # Read-only actions never require approval
+    if meta["severity"] == ActionSeverity.READ_ONLY:
+        return False
+        
+    # Admins can bypass medium severity approvals if needed (optional logic)
+    # For now, require approval for any non-read operation
+    return True
 
 def _call_model_with_fallback(client, model, contents, trace):
-    """Try `model` if we already resolved one, else walk MODEL_CANDIDATES.
-    Returns (response, resolved_model) or (None, None) on total failure."""
     candidates_to_try = [model] if model else MODEL_CANDIDATES
     last_error = None
     for candidate_model in candidates_to_try:
@@ -120,19 +112,16 @@ def _call_model_with_fallback(client, model, contents, trace):
         except Exception as e:
             last_error = e
             if "404" in str(e) or "NOT_FOUND" in str(e) or "429" in str(e):
-                continue  # this model is dead/exhausted -> try the next one
-            break  # some other error (bad key, network) -> don't keep guessing
+                continue
+            break
     trace.log("error", message=f"Gemini API error: {last_error}")
     return None, None
 
-
-def _run_turns(client, model, contents, trace, api_key, turns_used=0):
-    """Runs the agent loop starting from `contents`. Returns either a
-    final answer (str) or a PendingAction if a write tool needs confirmation."""
+def _run_turns(client, model, contents, trace, api_key, user_context: UserContext, turns_used=0):
     for turn in range(turns_used, MAX_TURNS):
         response, model = _call_model_with_fallback(client, model, contents, trace)
         if response is None:
-            return f"Agent failed due to an API error."
+            return "Agent failed due to an API error."
 
         candidate = response.candidates[0]
         parts = candidate.content.parts or []
@@ -149,18 +138,38 @@ def _run_turns(client, model, contents, trace, api_key, turns_used=0):
 
         contents.append(candidate.content)
 
-        # If any requested call is a write tool, pause for confirmation before
-        # executing ANYTHING else this turn (keeps the flow simple to reason about).
-        write_call = next((fc for fc in function_calls if fc.name in WRITE_TOOLS), None)
-        if write_call is not None:
-            args = dict(write_call.args) if write_call.args else {}
-            trace.log("tool_call", tool=write_call.name, input=args)
-            trace.log("confirmation_required", tool=write_call.name, input=args)
-            return PendingAction(
-                tool=write_call.name, input=args,
-                _contents=contents, _model=model, _api_key=api_key,
-            )
+        # Check for tool execution permissions & HITL gates
+        for fc in function_calls:
+            meta = TOOL_METADATA.get(fc.name, {"severity": ActionSeverity.HIGH, "min_role": UserRole.ADMIN})
+            
+            # 1. RBAC check
+            role_hierarchy = {UserRole.VIEWER: 1, UserRole.OPERATOR: 2, UserRole.ADMIN: 3}
+            if role_hierarchy[user_context.role] < role_hierarchy[meta["min_role"]]:
+                error_msg = f"Permission Denied: User role '{user_context.role.value}' cannot execute '{fc.name}'."
+                trace.log("permission_denied", tool=fc.name, user=user_context.user_id)
+                
+                # Report permission error back to the model turn
+                contents.append(types.Content(role="user", parts=[
+                    types.Part.from_function_response(name=fc.name, response={"error": error_msg})
+                ]))
+                continue
 
+            # 2. HITL Approval Check
+            if _requires_approval(fc.name, user_context):
+                args = dict(fc.args) if fc.args else {}
+                trace.log("tool_call", tool=fc.name, input=args)
+                trace.log("confirmation_required", tool=fc.name, input=args)
+                return PendingAction(
+                    tool=fc.name,
+                    input=args,
+                    severity=meta["severity"],
+                    user_context=user_context,
+                    _contents=contents,
+                    _model=model,
+                    _api_key=api_key,
+                )
+
+        # Execute read-only / auto-approved tools
         response_parts = []
         for fc in function_calls:
             args = dict(fc.args) if fc.args else {}
@@ -172,33 +181,27 @@ def _run_turns(client, model, contents, trace, api_key, turns_used=0):
                 try:
                     result = handler(args)
                 except Exception as e:
-                    result = {"error": f"Tool raised an exception: {e}"}
+                    result = {"error": f"Tool execution failed: {str(e)}"}
+            
             trace.log("tool_result", tool=fc.name, result=result)
             response_parts.append(types.Part.from_function_response(name=fc.name, response=result))
 
         contents.append(types.Content(role="user", parts=response_parts))
 
-    trace.log("error", message="Agent hit the max-turn limit without reaching a final answer.")
-    return "Agent hit the max-turn limit without reaching a final answer."
+    trace.log("error", message="Agent exceeded turn limit.")
+    return "Agent hit the maximum iteration limit."
 
-
-def run_agent(user_query: str, api_key: str | None = None):
-    """Runs the agent loop for a single user query.
-    Returns (result, trace) where result is either:
-      - a str final answer, or
-      - a PendingAction if a write tool needs human confirmation
-    """
+def run_agent(user_query: str, user_context: Optional[UserContext] = None, api_key: Optional[str] = None):
+    if user_context is None:
+        user_context = UserContext(user_id="default_user", role=UserRole.OPERATOR)
+        
     client = genai.Client(api_key=api_key or os.environ.get("GEMINI_API_KEY"))
     trace = TraceLogger(user_query)
     contents = [types.Content(role="user", parts=[types.Part.from_text(text=user_query)])]
-    result = _run_turns(client, None, contents, trace, api_key)
+    result = _run_turns(client, None, contents, trace, api_key, user_context)
     return result, trace
 
-
 def resume_agent(pending: PendingAction, approved: bool, trace: TraceLogger):
-    """Call after a human has approved/rejected a PendingAction. Executes
-    (or skips) the write tool, feeds the result back to the model, and
-    continues the loop. Returns (result, trace) with the same shape as run_agent."""
     client = genai.Client(api_key=pending._api_key or os.environ.get("GEMINI_API_KEY"))
 
     if approved:
@@ -206,10 +209,10 @@ def resume_agent(pending: PendingAction, approved: bool, trace: TraceLogger):
         try:
             result_data = handler(pending.input)
         except Exception as e:
-            result_data = {"error": f"Tool raised an exception: {e}"}
+            result_data = {"error": f"Tool execution error: {e}"}
         trace.log("tool_result", tool=pending.tool, result=result_data)
     else:
-        result_data = {"status": "cancelled_by_user"}
+        result_data = {"status": "cancelled_by_user", "message": "Action rejected by human operator."}
         trace.log("action_cancelled", tool=pending.tool, input=pending.input)
 
     pending._contents.append(
@@ -218,5 +221,4 @@ def resume_agent(pending: PendingAction, approved: bool, trace: TraceLogger):
             parts=[types.Part.from_function_response(name=pending.tool, response=result_data)],
         )
     )
-    result = _run_turns(client, pending._model, pending._contents, trace, pending._api_key)
-    return result, trace
+    return _run_turns(client, pending._model, pending._contents, trace, pending._api_key, pending.user_context)
