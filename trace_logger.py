@@ -26,24 +26,30 @@ class TraceLogger:
         self._print_step(entry)
         return entry
 
+    def get_logs(self):
+        """Returns the list of recorded step entries for the FastAPI server/dashboard."""
+        return self.steps
+
     def _print_step(self, entry):
         step, step_type = entry["step"], entry["type"]
         prefix = f"[{step:02d}] {step_type.upper():12s}"
         if step_type == "thought":
-            print(f"{prefix} {entry['text'][:300]}")
+            print(f"{prefix} {entry.get('text', '')[:300]}")
         elif step_type == "tool_call":
-            print(f"{prefix} {entry['tool']}({json.dumps(entry['input'])})")
+            print(f"{prefix} {entry.get('tool', '')}({json.dumps(entry.get('input', {}))})")
         elif step_type == "tool_result":
-            preview = json.dumps(entry["result"])[:300]
+            preview = json.dumps(entry.get("result", {}))[:300]
             print(f"{prefix} -> {preview}")
         elif step_type == "final_answer":
-            print(f"{prefix} {entry['text'][:300]}")
+            print(f"{prefix} {entry.get('text', '')[:300]}")
         elif step_type == "error":
-            print(f"{prefix} {entry['message']}")
+            print(f"{prefix} {entry.get('message', '')}")
         elif step_type == "confirmation_required":
-            print(f"{prefix} {entry['tool']}({json.dumps(entry['input'])}) -- awaiting human approval")
+            print(f"{prefix} {entry.get('tool', '')}({json.dumps(entry.get('input', {}))}) -- awaiting human approval")
         elif step_type == "action_cancelled":
-            print(f"{prefix} {entry['tool']}({json.dumps(entry['input'])}) -- cancelled by user")
+            print(f"{prefix} {entry.get('tool', '')}({json.dumps(entry.get('input', {}))}) -- cancelled by user")
+        else:
+            print(f"{prefix} {json.dumps(entry)}")
 
     def save(self, directory="logs"):
         os.makedirs(directory, exist_ok=True)
@@ -56,3 +62,22 @@ class TraceLogger:
                 indent=2,
             )
         return path
+    
+    def save(self):
+        """Saves the logged steps to a JSON file in the logs directory."""
+        log_dir = os.path.join(os.path.dirname(__file__), "logs")
+        os.makedirs(log_dir, exist_ok=True)
+        
+        filename = f"trace_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}.json"
+        filepath = os.path.join(log_dir, filename)
+        
+        output = {
+            "query": self.query,
+            "started_at": self.started_at,
+            "steps": self.steps
+        }
+        
+        with open(filepath, "w", encoding="utf-8") as f:
+            json.dump(output, f, indent=2)
+            
+        return filepath

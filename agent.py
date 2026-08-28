@@ -5,18 +5,21 @@ import os
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Dict, Optional, Set
+
 from google import genai
 from google.genai import types
 
+# Import custom tool definitions and logger
 from tools import github_tool, database_tool, weather_tool, ticket_write_tool
 from trace_logger import TraceLogger
 
+# Initialize Gemini Client with default key or environment variable fallback
+GEMINI_KEY = os.environ.get("GEMINI_API_KEY")
+client = genai.Client(api_key=GEMINI_KEY)
+
 MODEL_CANDIDATES = [
-    "gemini-2.5-flash-lite",
-    "gemini-flash-latest",
-    "gemini-3.5-flash-lite",
+    "gemini-3.6-flash",
     "gemini-2.5-flash",
-    "gemini-2.0-flash",
 ]
 MAX_TURNS = 8
 
@@ -94,16 +97,14 @@ def _requires_approval(tool_name: str, user_context: UserContext) -> bool:
     if meta["severity"] == ActionSeverity.READ_ONLY:
         return False
         
-    # Admins can bypass medium severity approvals if needed (optional logic)
-    # For now, require approval for any non-read operation
     return True
 
-def _call_model_with_fallback(client, model, contents, trace):
+def _call_model_with_fallback(client_instance, model, contents, trace):
     candidates_to_try = [model] if model else MODEL_CANDIDATES
     last_error = None
     for candidate_model in candidates_to_try:
         try:
-            response = client.models.generate_content(
+            response = client_instance.models.generate_content(
                 model=candidate_model, contents=contents, config=CONFIG
             )
             if model is None:
@@ -117,9 +118,9 @@ def _call_model_with_fallback(client, model, contents, trace):
     trace.log("error", message=f"Gemini API error: {last_error}")
     return None, None
 
-def _run_turns(client, model, contents, trace, api_key, user_context: UserContext, turns_used=0):
+def _run_turns(client_instance, model, contents, trace, api_key, user_context: UserContext, turns_used=0):
     for turn in range(turns_used, MAX_TURNS):
-        response, model = _call_model_with_fallback(client, model, contents, trace)
+        response, model = _call_model_with_fallback(client_instance, model, contents, trace)
         if response is None:
             return "Agent failed due to an API error."
 
@@ -195,14 +196,14 @@ def run_agent(user_query: str, user_context: Optional[UserContext] = None, api_k
     if user_context is None:
         user_context = UserContext(user_id="default_user", role=UserRole.OPERATOR)
         
-    client = genai.Client(api_key=api_key or os.environ.get("GEMINI_API_KEY"))
+    client_instance = genai.Client(api_key=api_key or os.environ.get("GEMINI_API_KEY"))
     trace = TraceLogger(user_query)
     contents = [types.Content(role="user", parts=[types.Part.from_text(text=user_query)])]
-    result = _run_turns(client, None, contents, trace, api_key, user_context)
+    result = _run_turns(client_instance, None, contents, trace, api_key, user_context)
     return result, trace
 
 def resume_agent(pending: PendingAction, approved: bool, trace: TraceLogger):
-    client = genai.Client(api_key=pending._api_key or os.environ.get("GEMINI_API_KEY"))
+    client_instance = genai.Client(api_key=pending._api_key or os.environ.get("GEMINI_API_KEY"))
 
     if approved:
         handler = DISPATCH.get(pending.tool)
@@ -221,4 +222,4 @@ def resume_agent(pending: PendingAction, approved: bool, trace: TraceLogger):
             parts=[types.Part.from_function_response(name=pending.tool, response=result_data)],
         )
     )
-    return _run_turns(client, pending._model, pending._contents, trace, pending._api_key, pending.user_context)
+    return _run_turns(client_instance, pending._model, pending._contents, trace, pending._api_key, pending.user_context)
